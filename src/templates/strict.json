@@ -1,0 +1,4 @@
+{
+  "allow": ["MIT", "ISC", "BSD-2-Clause", "Apache-2.0"],
+  "deny": ["AGPL-3.0", "GPL-2.0", "GPL-3.0", "LGPL-2.1", "LGPL-3.0", "MPL-2.0", "SSPL-1.0", "EUPL-1.2"]
+}
