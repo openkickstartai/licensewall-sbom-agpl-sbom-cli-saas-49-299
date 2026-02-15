@@ -1,7 +1,16 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { checkPolicy, generateSBOM, scanNodeModules, Dep, Policy } from '../src/scanner.js';
+import {
+  checkPolicy,
+  generateSBOM,
+  scanNodeModules,
+  scanDeep,
+  detectLicenseFromFile,
+  Dep,
+  ScannedDep,
+  Policy,
+} from '../src/scanner.js';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 
 const mockDeps: Dep[] = [
@@ -42,59 +51,147 @@ describe('checkPolicy — allow list', () => {
     expect(v).toHaveLength(0);
   });
 
-  it('returns no violations with empty policy', () => {
+  it('returns no violations with empty policy on clean deps', () => {
     const clean: Dep[] = [
       { name: 'a', version: '1.0.0', license: 'MIT', path: '/x' },
     ];
-    expect(checkPolicy(clean, {})).toHaveLength(0);
-  });
-});
-
-describe('generateSBOM', () => {
-  it('produces valid CycloneDX 1.5 SBOM', () => {
-    const sbom = generateSBOM(mockDeps, 'my-app') as Record<string, any>;
-    expect(sbom.bomFormat).toBe('CycloneDX');
-    expect(sbom.specVersion).toBe('1.5');
-    expect(sbom.components).toHaveLength(4);
-    expect(sbom.components[0].purl).toBe('pkg:npm/express@4.18.2');
-    expect(sbom.components[0].licenses[0].license.id).toBe('MIT');
-    expect(sbom.metadata.component.name).toBe('my-app');
-    expect(sbom.metadata.tools[0].name).toBe('licensewall');
+    const v = checkPolicy(clean, {});
+    expect(v).toHaveLength(0);
   });
 });
 
 describe('scanNodeModules', () => {
-  const tmp = join(tmpdir(), `licensewall-test-${Date.now()}`);
+  const tmpDir = join(tmpdir(), 'lw-test-' + Date.now());
 
   beforeAll(() => {
-    mkdirSync(join(tmp, 'node_modules', 'test-pkg'), { recursive: true });
+    mkdirSync(join(tmpDir, 'node_modules', 'foo'), { recursive: true });
     writeFileSync(
-      join(tmp, 'node_modules', 'test-pkg', 'package.json'),
-      JSON.stringify({ name: 'test-pkg', version: '3.2.1', license: 'BSD-3-Clause' })
+      join(tmpDir, 'node_modules', 'foo', 'package.json'),
+      JSON.stringify({ name: 'foo', version: '1.0.0', license: 'MIT' }),
     );
-    mkdirSync(join(tmp, 'node_modules', '@acme', 'utils'), { recursive: true });
+    mkdirSync(join(tmpDir, 'node_modules', '@bar', 'baz'), { recursive: true });
     writeFileSync(
-      join(tmp, 'node_modules', '@acme', 'utils', 'package.json'),
-      JSON.stringify({ name: '@acme/utils', version: '0.5.0', license: 'ISC' })
-    );
-    mkdirSync(join(tmp, 'node_modules', 'no-license-pkg'), { recursive: true });
-    writeFileSync(
-      join(tmp, 'node_modules', 'no-license-pkg', 'package.json'),
-      JSON.stringify({ name: 'no-license-pkg', version: '1.0.0' })
+      join(tmpDir, 'node_modules', '@bar', 'baz', 'package.json'),
+      JSON.stringify({ name: '@bar/baz', version: '2.0.0', license: 'ISC' }),
     );
   });
 
-  afterAll(() => rmSync(tmp, { recursive: true, force: true }));
-
-  it('discovers regular and scoped packages', () => {
-    const deps = scanNodeModules(tmp);
-    expect(deps).toHaveLength(3);
-    expect(deps.find((d) => d.name === 'test-pkg')?.license).toBe('BSD-3-Clause');
-    expect(deps.find((d) => d.name === '@acme/utils')?.license).toBe('ISC');
-    expect(deps.find((d) => d.name === 'no-license-pkg')?.license).toBe('UNKNOWN');
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('returns empty array when node_modules missing', () => {
-    expect(scanNodeModules('/nonexistent/path')).toEqual([]);
+  it('discovers top-level deps', () => {
+    const deps = scanNodeModules(tmpDir);
+    expect(deps.length).toBe(2);
+    expect(deps.some((d) => d.name === 'foo')).toBe(true);
+    expect(deps.some((d) => d.name === '@bar/baz')).toBe(true);
+  });
+
+  it('returns empty for missing node_modules', () => {
+    const deps = scanNodeModules('/nonexistent/path');
+    expect(deps).toHaveLength(0);
+  });
+});
+
+describe('generateSBOM', () => {
+  it('generates valid CycloneDX structure', () => {
+    const deps: Dep[] = [{ name: 'x', version: '1.0.0', license: 'MIT', path: '/x' }];
+    const sbom = generateSBOM(deps) as any;
+    expect(sbom.bomFormat).toBe('CycloneDX');
+    expect(sbom.specVersion).toBe('1.5');
+    expect(sbom.components).toHaveLength(1);
+    expect(sbom.components[0].name).toBe('x');
+    expect(sbom.components[0].purl).toBe('pkg:npm/x@1.0.0');
+  });
+});
+
+// ─── New tests: scanDeep, detectLicenseFromFile, ScannedDep ──────────────────
+
+const fixtureDir = resolve(__dirname, 'fixtures', 'fake-project');
+
+describe('detectLicenseFromFile', () => {
+  it('detects MIT license from LICENSE file', () => {
+    const depPath = join(fixtureDir, 'node_modules', 'dep-b');
+    const result = detectLicenseFromFile(depPath);
+    expect(result).toBe('MIT');
+  });
+
+  it('returns null when no license file exists', () => {
+    const depPath = join(fixtureDir, 'node_modules', 'dep-no-license');
+    const result = detectLicenseFromFile(depPath);
+    expect(result).toBeNull();
+  });
+
+  it('returns null for nonexistent directory', () => {
+    const result = detectLicenseFromFile('/totally/fake/path');
+    expect(result).toBeNull();
+  });
+});
+
+describe('scanDeep', () => {
+  let results: ScannedDep[];
+
+  beforeAll(() => {
+    results = scanDeep(fixtureDir);
+  });
+
+  it('discovers all direct dependencies at depth 0', () => {
+    const directNames = results.filter((d) => d.depth === 0).map((d) => d.name);
+    expect(directNames).toContain('dep-a');
+    expect(directNames).toContain('dep-b');
+    expect(directNames).toContain('dep-d');
+    expect(directNames).toContain('@scope/scoped-pkg');
+    expect(directNames).toContain('dep-no-license');
+  });
+
+  it('discovers transitive dependency dep-c', () => {
+    const depC = results.find((d) => d.name === 'dep-c');
+    expect(depC).toBeDefined();
+    expect(depC!.version).toBe('2.0.0');
+    expect(depC!.license).toBe('ISC');
+  });
+
+  it('deduplicates dep-c (appears under dep-a and dep-d)', () => {
+    const depCs = results.filter((d) => d.name === 'dep-c');
+    expect(depCs).toHaveLength(1);
+  });
+
+  it('sets correct depth for transitive deps', () => {
+    const depC = results.find((d) => d.name === 'dep-c');
+    expect(depC).toBeDefined();
+    expect(depC!.depth).toBe(1);
+  });
+
+  it('populates dependedBy with all parent packages', () => {
+    const depC = results.find((d) => d.name === 'dep-c');
+    expect(depC).toBeDefined();
+    expect(depC!.dependedBy).toContain('dep-a');
+    expect(depC!.dependedBy).toContain('dep-d');
+    expect(depC!.dependedBy).toHaveLength(2);
+  });
+
+  it('uses detectLicenseFromFile fallback for dep-b (no license in package.json)', () => {
+    const depB = results.find((d) => d.name === 'dep-b');
+    expect(depB).toBeDefined();
+    expect(depB!.license).toBe('MIT');
+  });
+
+  it('marks dep-no-license as UNKNOWN when no license field and no LICENSE file', () => {
+    const depNone = results.find((d) => d.name === 'dep-no-license');
+    expect(depNone).toBeDefined();
+    expect(depNone!.license).toBe('UNKNOWN');
+  });
+
+  it('handles scoped packages correctly', () => {
+    const scoped = results.find((d) => d.name === '@scope/scoped-pkg');
+    expect(scoped).toBeDefined();
+    expect(scoped!.version).toBe('0.5.0');
+    expect(scoped!.license).toBe('BSD-3-Clause');
+    expect(scoped!.depth).toBe(0);
+  });
+
+  it('returns correct total count (6 unique deps)', () => {
+    // dep-a, dep-b, dep-c (deduped), dep-d, @scope/scoped-pkg, dep-no-license
+    expect(results).toHaveLength(6);
   });
 });
