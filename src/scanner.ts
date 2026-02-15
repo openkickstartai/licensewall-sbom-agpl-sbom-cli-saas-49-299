@@ -104,3 +104,6 @@ export function generateSBOM(deps: Dep[], name = 'project'): object {
     })),
   };
 }
+
+export { generateSBOM, writeSBOM } from './sbom.js';
+export type { CycloneDXDocument, CycloneDXComponent, ScannedDep } from './sbom.js';
